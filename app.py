@@ -1,94 +1,101 @@
-from pathlib import Path
-import joblib
-import numpy as np
+import io
+import os
 import pandas as pd
-from flask import Flask, request, jsonify
+import requests
+import streamlit as st
 
-superkart_api = Flask(__name__)
-superkart_api.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+BACKEND_URL = os.getenv(
+    "BACKEND_URL", "http://backend:7860"
+).rstrip("/")
 
-model = joblib.load(
-    Path(__file__).with_name("superkart_model.joblib")
-)
-features = list(model.feature_names_in_)
+st.title("SuperKart Sales Prediction")
+st.write("Enter product and store details to estimate revenue.")
+st.caption("Store age uses the project's 2025 reference year.")
 
-numeric_features = [
-    "Product_Weight",
-    "Product_Allocated_Area",
-    "Product_MRP",
-    "Store_Age_Years"
-]
-
-def validate(frame):
-    missing = sorted(set(features) - set(frame.columns))
-    if missing:
-        raise ValueError("Missing fields: " + ", ".join(missing))
-    if frame.empty:
-        raise ValueError("Provide at least one record.")
-
-    frame = frame[features].copy()
-
-    if frame.isna().any().any():
-        raise ValueError("Missing values are not allowed.")
-
-    for column in numeric_features:
-        frame[column] = pd.to_numeric(frame[column], errors="raise")
-        if not np.isfinite(frame[column]).all():
-            raise ValueError(column + " must contain finite numbers.")
-        if (frame[column] < 0).any():
-            raise ValueError(column + " cannot be negative.")
-
-    if (frame["Product_Allocated_Area"] > 1).any():
-        raise ValueError("Product_Allocated_Area must be between 0 and 1.")
-
-    frame["Product_Sugar_Content"] = (
-        frame["Product_Sugar_Content"].replace({"reg": "Regular"})
+with st.form("single_prediction"):
+    weight = st.number_input("Product Weight", min_value=0.0, value=12.66)
+    sugar = st.selectbox(
+        "Product Sugar Content", ["Low Sugar", "Regular", "No Sugar"]
     )
-    return frame
-
-@superkart_api.errorhandler(ValueError)
-def invalid_input(error):
-    return jsonify({"error": str(error)}), 400
-
-@superkart_api.after_request
-def add_warning(response):
-    response.headers["X-Model-Warning"] = (
-        "Unseen categories, including Supermarket Type3, "
-        "are not validated by training results."
+    area = st.number_input(
+        "Product Allocated Area", min_value=0.0,
+        max_value=1.0, value=0.027, format="%.4f"
     )
-    return response
+    mrp = st.number_input("Product MRP", min_value=0.0, value=117.08)
+    size = st.selectbox("Store Size", ["Medium", "Small", "High"])
+    city = st.selectbox(
+        "Store Location City Type", ["Tier 2", "Tier 1", "Tier 3"]
+    )
+    store_type = st.selectbox(
+        "Store Type",
+        ["Supermarket Type2", "Supermarket Type1",
+         "Departmental Store", "Food Mart", "Supermarket Type3"]
+    )
+    prefix = st.selectbox("Product ID Prefix", ["FD", "DR", "NC"])
+    age = st.number_input("Store Age in Years", min_value=0, value=16)
+    category = st.selectbox(
+        "Product Type Category", ["Non Perishables", "Perishables"]
+    )
+    submitted = st.form_submit_button("Predict")
 
-@superkart_api.get("/")
-def home():
-    return jsonify({"status": "ready", "service": "SuperKart API"})
-
-@superkart_api.post("/v1/predict")
-def predict():
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        raise ValueError("Provide a JSON object.")
-
-    frame = validate(pd.DataFrame([payload]))
-    prediction = model.predict(frame)[0]
-    return jsonify({"Sales": round(float(prediction), 2)})
-
-@superkart_api.post("/v1/predictbatch")
-def predict_batch():
-    if "file" not in request.files:
-        raise ValueError("Upload a CSV using the file field.")
-
+if submitted:
+    payload = {
+        "Product_Weight": weight,
+        "Product_Sugar_Content": sugar,
+        "Product_Allocated_Area": area,
+        "Product_MRP": mrp,
+        "Store_Size": size,
+        "Store_Location_City_Type": city,
+        "Store_Type": store_type,
+        "Product_Id_char": prefix,
+        "Store_Age_Years": age,
+        "Product_Type_Category": category
+    }
     try:
-        frame = pd.read_csv(request.files["file"])
-    except (pd.errors.ParserError, pd.errors.EmptyDataError, UnicodeDecodeError):
-        raise ValueError("Unable to read the CSV file.")
+        response = requests.post(
+            BACKEND_URL + "/v1/predict", json=payload, timeout=60
+        )
+        response.raise_for_status()
+        st.success(f"Predicted revenue: {response.json()['Sales']:,.2f}")
+    except requests.RequestException as error:
+        st.error(f"Prediction request failed: {error}")
 
-    frame = validate(frame)
-    predictions = model.predict(frame)
+st.warning(
+    "Supermarket Type3 was absent from training. Predictions for "
+    "this category require review. New store combinations are also unvalidated."
+)
 
-    return jsonify({
-        str(i): round(float(value), 2)
-        for i, value in enumerate(predictions)
-    })
+st.subheader("Batch Prediction")
+st.write("Upload a CSV containing the ten model input columns.")
+uploaded_file = st.file_uploader("Choose CSV", type=["csv"])
 
-if __name__ == "__main__":
-    superkart_api.run(host="0.0.0.0", port=7860)
+if uploaded_file is not None and st.button("Predict for Batch"):
+    try:
+        raw = uploaded_file.getvalue()
+        frame = pd.read_csv(io.BytesIO(raw))
+
+        response = requests.post(
+            BACKEND_URL + "/v1/predictbatch",
+            files={"file": ("batch.csv", raw, "text/csv")},
+            timeout=60
+        )
+        response.raise_for_status()
+        predictions = response.json()
+
+        frame["Predicted_Sales"] = [
+            predictions[str(i)] for i in range(len(frame))
+        ]
+        st.session_state["batch_results"] = frame
+    except (requests.RequestException, ValueError, KeyError) as error:
+        st.error(f"Batch prediction failed: {error}")
+
+if "batch_results" in st.session_state:
+    results = st.session_state["batch_results"]
+    st.success(f"Predictions completed for {len(results)} records")
+    st.dataframe(results, use_container_width=True)
+    st.download_button(
+        "Download Predictions",
+        results.to_csv(index=False),
+        "superkart_predictions.csv",
+        "text/csv"
+    )
